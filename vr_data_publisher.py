@@ -5,39 +5,34 @@
 与Master进程（Python 3.8 + ROS）通过IPC通信。
 
 Usage:
-    python3 -m robo_avatar.vr_teleop.vr_data_publisher [--config CONFIG_PATH]
+    python3 vr_data_publisher.py [--config CONFIG_PATH]
 """
+
 import argparse
-import json
 import logging
+import math
 import signal
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-import yaml 
+import yaml
+
+from vr_message import VRDataMessage, VRControllerData
+from xr_sdk_client import XRClient
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 try:
     import zmq
+    from vr_haptic_relay import HapticWorker
 except ImportError:
     logger.error("pyzmq is required. Install with: pip install pyzmq")
     sys.exit(1)
-
-try:
-    import xrobotoolkit_sdk as xrt
-except ImportError:
-    logger.error("xrobotoolkit_sdk is required for VR support. Please install XRoboToolkit-PC-Service-Pybind.")
-    sys.exit(1)
-
-from vr_message import VRDataMessage, VRControllerData, BUTTON_NAMES
 
 
 class VRDataPublisher:
@@ -46,10 +41,15 @@ class VRDataPublisher:
     def __init__(self, config: dict):
         self._config = config
         self._running = False
+        self._sdk_started = False
+        self._haptic_worker = None
+        self._sdk = None
 
         zmq_cfg = config.get("zmq", {})
         self._ipc_addr = zmq_cfg.get("ipc_addr", "ipc:///tmp/vr_data.ipc")
         self._publish_rate = config.get("publish_rate", 80)
+        if self._publish_rate <= 0:
+            raise ValueError("publish_rate must be positive")
         self._interval = 1.0 / self._publish_rate
 
         self._context: Optional[zmq.Context] = None
@@ -57,9 +57,13 @@ class VRDataPublisher:
 
     def start(self) -> None:
         """初始化VR SDK和ZeroMQ。"""
+        if self._sdk_started:
+            raise RuntimeError("VR SDK session is already running")
         logger.info("Initializing VR SDK...")
         try:
-            xrt.init()
+            self._sdk = XRClient()
+            self._sdk.init()
+            self._sdk_started = True
             logger.info("VR SDK initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize VR SDK: {e}")
@@ -69,12 +73,19 @@ class VRDataPublisher:
         try:
             self._context = zmq.Context()
             self._socket = self._context.socket(zmq.PUB)
+            self._socket.setsockopt(zmq.LINGER, 0)
             self._socket.set_hwm(10)  # 设置高水位标记，防止消息积压
             self._socket.bind(self._ipc_addr)
             logger.info(f"ZeroMQ PUB socket bound to {self._ipc_addr}")
+            haptic_cfg = self._config.get("haptic", {})
+            if haptic_cfg.get("enabled", True):
+                self._haptic_worker = HapticWorker(
+                    self._context, self._sdk, haptic_cfg, self._interval
+                )
+                self._haptic_worker.start()
         except Exception as e:
             logger.error(f"Failed to initialize ZeroMQ: {e}")
-            xrt.close()
+            self.stop()
             raise
 
         self._running = True
@@ -85,76 +96,78 @@ class VRDataPublisher:
         logger.info("Stopping VR Data Publisher...")
         self._running = False
 
+        if self._haptic_worker is not None:
+            self._haptic_worker.stop()
+            self._haptic_worker = None
+
         if self._socket:
-            self._socket.close()
+            self._socket.close(linger=0)
             self._socket = None
 
         if self._context:
             self._context.term()
             self._context = None
 
-        try:
-            xrt.close()
-            logger.info("VR SDK closed")
-        except Exception as e:
-            logger.warning(f"Error closing VR SDK: {e}")
+        if self._sdk_started:
+            self._sdk_started = False
+            try:
+                self._sdk.close()
+                logger.info("VR SDK closed")
+            except Exception as e:
+                logger.warning(f"Error closing VR SDK: {e}")
 
     def _collect_vr_data(self) -> Optional[VRDataMessage]:
         """采集VR数据。"""
         try:
-            timestamp_ns = xrt.get_time_stamp_ns()
+            data = self._sdk.get_tracking_data()
+            if data is None:
+                return None
+            timestamp_ns = int(data["timeStampNs"])
+            controllers = data["Controller"]
+            left, right = controllers["left"], controllers["right"]
+            head = data.get("Head", {"pose": "0,0,0,0,0,0,0"})
+            if any(part.get("valid") is False for part in (left, right, head)):
+                return None
 
-            # 头显位姿 - 使用np.array确保兼容各种返回类型
-            headset_raw = xrt.get_headset_pose()
-            headset_pose = list(np.array(headset_raw).flatten())[:7]
+            def pose(part):
+                values = [float(value) for value in part["pose"].split(",")]
+                if len(values) != 7 or not all(math.isfinite(v) for v in values):
+                    raise ValueError("Expected seven finite pose components")
+                return values
 
-            # 左控制器
-            left_pose_raw = xrt.get_left_controller_pose()
-            left_pose = list(np.array(left_pose_raw).flatten())[:7]
-            left_controller = VRControllerData(
-                timestamp_ns=timestamp_ns,
-                position=left_pose[:3],
-                orientation=left_pose[3:7],
-                trigger=float(xrt.get_left_trigger()),
-                grip=float(xrt.get_left_grip()),
-                axis=list(np.array(xrt.get_left_axis()).flatten()),
-            )
+            def controller(part):
+                values = pose(part)
+                return VRControllerData(
+                    timestamp_ns=timestamp_ns,
+                    position=values[:3],
+                    orientation=values[3:],
+                    trigger=float(part["trigger"]),
+                    grip=float(part["grip"]),
+                    axis=[float(part["axisX"]), float(part["axisY"])],
+                )
 
-            # 右控制器
-            right_pose_raw = xrt.get_right_controller_pose()
-            right_pose = list(np.array(right_pose_raw).flatten())[:7]
-            right_controller = VRControllerData(
-                timestamp_ns=timestamp_ns,
-                position=right_pose[:3],
-                orientation=right_pose[3:7],
-                trigger=float(xrt.get_right_trigger()),
-                grip=float(xrt.get_right_grip()),
-                axis=list(np.array(xrt.get_right_axis()).flatten()),
-            )
-
-            # 按键状态
             buttons = {
-                "A":                bool(xrt.get_A_button()),
-                "B":                bool(xrt.get_B_button()),
-                "X":                bool(xrt.get_X_button()),
-                "Y":                bool(xrt.get_Y_button()),
-                "left_menu_button":  bool(xrt.get_left_menu_button()),
-                "right_menu_button": bool(xrt.get_right_menu_button()),
-                "left_axis_click":   bool(xrt.get_left_axis_click()),
-                "right_axis_click":  bool(xrt.get_right_axis_click()),
+                "A": bool(right["primaryButton"]),
+                "B": bool(right["secondaryButton"]),
+                "X": bool(left["primaryButton"]),
+                "Y": bool(left["secondaryButton"]),
+                "left_menu_button": bool(left["menuButton"]),
+                "right_menu_button": bool(right["menuButton"]),
+                "left_axis_click": bool(left["axisClick"]),
+                "right_axis_click": bool(right["axisClick"]),
             }
-
             return VRDataMessage(
                 timestamp_ns=timestamp_ns,
-                headset_pose=headset_pose,
-                left_controller=left_controller,
-                right_controller=right_controller,
+                headset_pose=pose(head),
+                left_controller=controller(left),
+                right_controller=controller(right),
                 buttons=buttons,
             )
 
         except Exception as e:
             logger.warning(f"Error collecting VR data: {e}")
             import traceback
+
             traceback.print_exc()
             return None
 
@@ -163,19 +176,19 @@ class VRDataPublisher:
         logger.info("Starting main publish loop...")
 
         while self._running:
-            start_time = time.time()
+            start_time = time.monotonic()
 
             # 采集数据
             msg = self._collect_vr_data()
             if msg is not None:
                 try:
-                    self._socket.send(msg.to_json().encode("utf-8"))
+                    self._socket.send(msg.to_json().encode("utf-8"), flags=zmq.NOBLOCK)
                     logger.debug(f"Published VR data at {msg.timestamp_ns}")
                 except Exception as e:
                     logger.warning(f"Failed to publish message: {e}")
 
             # 控制频率
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
             sleep_time = self._interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
@@ -195,9 +208,10 @@ def load_config(path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="VR Data Publisher")
     parser.add_argument(
-        "--config", "-c",
-        default=str(Path(__file__).resolve().parents[2] / "configs" / "vr_bridge.yaml"),
-        help="Path to config file"
+        "--config",
+        "-c",
+        default=str(Path(__file__).resolve().parent / "configs" / "vr_bridge.yaml"),
+        help="Path to config file",
     )
     args = parser.parse_args()
 

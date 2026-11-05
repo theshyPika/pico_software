@@ -7,3 +7,11 @@ publish_rate: 80
 
 # ZeroMQ高水位标记（消息缓冲区大小）
 buffer_size: 10
+
+# Relay shares the publisher's XR SDK session. Install the fixed headset App first.
+haptic:
+  enabled: true
+  cmd_addr: "ipc:///tmp/vr_haptic.ipc"
+  max_command_age_ms: 250
+  # Automatically selects the sole online headset. Optional restriction:
+  # device_id: "<HEADSET_DEVICE_ID>"
